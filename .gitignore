@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment created by uv
+.venv/
+
+# Tools
+.pytest_cache/
+
+# Benchmark output files (commit specific ones on purpose with git add -f)
+results*.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
