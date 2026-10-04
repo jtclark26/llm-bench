@@ -1,8 +1,8 @@
-"""Send one streaming chat request and measure how long each part takes.
+"""Send a single streaming chat request and time the response.
 
-The network code (send_request) only records *when* each line of the stream
-arrived. All the maths is done afterwards in pure functions (parse_sse_line,
-summarise_stream), so they can be tested with fake data and no server.
+send_request only records when each line of the stream arrives. Parsing and
+the calculations happen afterwards in summarise_stream, which keeps them
+testable without a server.
 """
 
 import json
@@ -16,24 +16,19 @@ DEFAULT_PROMPT = "Write a short story (about 300 words) about a robot learning t
 
 @dataclass
 class RequestResult:
-    """The outcome of one request. Times are in seconds."""
+    """Outcome of one request. All times are in seconds."""
 
     ok: bool
     ttft: float | None = None  # time to first token
-    latency: float | None = None  # end-to-end: request sent -> stream finished
+    latency: float | None = None  # request sent until stream finished
     output_tokens: int = 0
     tokens_per_sec: float | None = None  # generation speed after the first token
-    usage_reported: bool = False  # True if the server told us the token count
+    usage_reported: bool = False  # token count came from the server, not estimated
     error: str | None = None
 
 
 def parse_sse_line(line: str) -> str | None:
-    """Return the data part of one server-sent events (SSE) line, or None.
-
-    An SSE stream is plain text. Each event looks like 'data: <something>'
-    followed by a blank line. Blank lines and anything else carry no data
-    for us, so we return None for those.
-    """
+    """Return the payload of an SSE 'data:' line, or None for any other line."""
     line = line.strip()
     if not line.startswith("data:"):
         return None
@@ -41,7 +36,7 @@ def parse_sse_line(line: str) -> str | None:
 
 
 def chunk_text(chunk: dict) -> str:
-    """Get the generated text out of one parsed chunk ('' if there is none)."""
+    """Return the text content of a stream chunk, or '' if it has none."""
     choices = chunk.get("choices") or []
     if not choices:
         return ""
@@ -50,28 +45,25 @@ def chunk_text(chunk: dict) -> str:
 
 
 def summarise_stream(start_time: float, timed_lines: list[tuple[float, str]]) -> RequestResult:
-    """Turn the raw (arrival_time, line) pairs from one stream into a result.
-
-    start_time is when the request was sent. Times come from time.perf_counter().
-    """
+    """Calculate the metrics for one request from (arrival_time, line) pairs."""
     first_token_time = None
     last_token_time = None
-    chunk_count = 0  # chunks that contained some text
+    chunk_count = 0
     usage_tokens = None
 
     for arrival_time, line in timed_lines:
         payload = parse_sse_line(line)
         if payload is None:
             continue
-        if payload == "[DONE]":  # the server's "end of stream" marker
+        if payload == "[DONE]":
             break
 
         chunk = json.loads(payload)
 
-        if "error" in chunk:  # some servers report errors inside the stream
+        if "error" in chunk:  # some servers report errors mid-stream
             return RequestResult(ok=False, error=str(chunk["error"]))
 
-        if chunk.get("usage"):  # only sent at the end, if the server supports it
+        if chunk.get("usage"):  # only in the final chunk, if supported
             usage_tokens = chunk["usage"].get("completion_tokens")
 
         if chunk_text(chunk):
@@ -83,8 +75,8 @@ def summarise_stream(start_time: float, timed_lines: list[tuple[float, str]]) ->
     if first_token_time is None:
         return RequestResult(ok=False, error="stream ended without any tokens")
 
-    # Prefer the server's real token count; fall back to counting text chunks
-    # (Ollama sends roughly one token per chunk, so this is a close estimate).
+    # Use the server's token count if it sent one. Otherwise count text chunks,
+    # which is close because Ollama sends about one token per chunk.
     if usage_tokens:
         output_tokens = usage_tokens
         usage_reported = True
@@ -92,8 +84,8 @@ def summarise_stream(start_time: float, timed_lines: list[tuple[float, str]]) ->
         output_tokens = chunk_count
         usage_reported = False
 
-    # Speed of generation *after* the first token. The first token's time is
-    # already in TTFT, so we count the gaps between tokens: n tokens -> n - 1 gaps.
+    # The first token is already covered by TTFT, so measure the n - 1 gaps
+    # between n tokens.
     generation_time = last_token_time - first_token_time
     if output_tokens > 1 and generation_time > 0:
         tokens_per_sec = (output_tokens - 1) / generation_time
@@ -119,10 +111,10 @@ def send_request(
     max_tokens: int = 256,
     timeout: float = 120.0,
 ) -> RequestResult:
-    """Send one streaming chat request and time every line that comes back.
+    """Send one streaming chat request and return its timings.
 
-    Never raises for network or server problems: it returns ok=False instead,
-    so one failed request can't crash a whole benchmark run.
+    Errors are returned as a failed RequestResult instead of raised, so one
+    bad request doesn't stop a benchmark run.
     """
     url = base_url.rstrip("/") + "/chat/completions"
     body = {
@@ -130,8 +122,7 @@ def send_request(
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": True,
-        # Ask the server to send the exact token count in a final chunk.
-        "stream_options": {"include_usage": True},
+        "stream_options": {"include_usage": True},  # request a final usage chunk
     }
 
     timed_lines = []
@@ -139,14 +130,14 @@ def send_request(
     try:
         with httpx.stream("POST", url, json=body, timeout=timeout) as response:
             if response.status_code != 200:
-                response.read()  # load the error body so we can show it
+                response.read()  # load the body so the error message can be shown
                 return RequestResult(
                     ok=False, error=f"HTTP {response.status_code}: {response.text[:200]}"
                 )
             for line in response.iter_lines():
                 timed_lines.append((time.perf_counter(), line))
         return summarise_stream(start_time, timed_lines)
-    except httpx.HTTPError as e:  # connection refused, timeout, dropped stream...
+    except httpx.HTTPError as e:  # connection refused, timeout, dropped stream
         return RequestResult(ok=False, error=f"{type(e).__name__}: {e}")
-    except ValueError as e:  # a chunk that wasn't valid JSON
+    except ValueError as e:  # invalid JSON in the stream
         return RequestResult(ok=False, error=f"bad data in stream: {e}")

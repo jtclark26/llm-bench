@@ -5,13 +5,13 @@ __pycache__/
 build/
 dist/
 
-# Virtual environment created by uv
+# Virtual environment
 .venv/
 
-# Tools
+# Test cache
 .pytest_cache/
 
-# Benchmark output files (commit specific ones on purpose with git add -f)
+# Benchmark results
 results*.json
 
 # OS / editor
